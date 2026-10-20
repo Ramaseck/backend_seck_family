@@ -9,6 +9,16 @@ router.use(auth_1.requireAuth);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 class SyncError extends Error {
 }
+// Essence : un seul crédit ouvert par client, sauf si 50 % ont été remboursés.
+// Bateau Vente Poisson et autres activités : aucune limite.
+const SEUIL_REMBOURSEMENT_ESSENCE = 0.5;
+function estEssence(nom) {
+    return nom
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .includes('essence');
+}
 // handlers[entité][nom d'opération] = fonction qui applique l'opération.
 // Chaque fonction reçoit (id, payload, userId) et lève une SyncError pour un refus métier
 // (le push la renvoie telle quelle au mobile), ou toute autre erreur pour un vrai échec technique
@@ -65,6 +75,7 @@ const handlers = {
                         id,
                         activiteId,
                         numeroSession,
+                        nom: p.nom ? String(p.nom).trim() : null,
                         quantiteStock: p.quantiteStock ?? 0,
                         quantiteInitiale: p.quantiteInitiale ?? 0,
                         prixAchatUnitaire: p.prixAchatUnitaire ?? 0,
@@ -123,72 +134,133 @@ const handlers = {
             if (!['COMPTANT', 'CREDIT'].includes(p.modePaiement)) {
                 throw new SyncError('Mode de paiement invalide.');
             }
-            try {
-                await prisma_1.prisma.$transaction(async (tx) => {
-                    const produit = await tx.produit.findUnique({ where: { id: p.produitId } });
-                    if (!produit)
-                        throw new SyncError('Produit introuvable.');
-                    if (Number(produit.quantiteStock) < quantite) {
-                        throw new SyncError(`Stock insuffisant (${produit.quantiteStock} restant, ${quantite} demandé).`);
-                    }
-                    if (p.modePaiement === 'CREDIT') {
-                        const creditExistant = await tx.credit.findFirst({
-                            where: { clientId: p.clientId, activiteId: p.activiteId, statut: 'EN_COURS' },
-                        });
-                        if (creditExistant) {
-                            throw new SyncError('Ce client a déjà un emprunt en cours sur cette activité. Il doit rembourser avant un nouveau crédit.');
-                        }
-                    }
-                    await tx.produit.update({
-                        where: { id: p.produitId },
-                        data: { quantiteStock: { decrement: quantite } },
-                    });
-                    await tx.vente.create({
-                        data: {
-                            id,
-                            activiteId: p.activiteId,
-                            clientId: p.clientId,
-                            produitId: p.produitId,
-                            saisiParId: userId,
-                            quantite,
-                            montant,
-                            modePaiement: p.modePaiement,
-                            date: p.date ? new Date(p.date) : new Date(),
-                        },
-                    });
-                    if (p.modePaiement === 'CREDIT') {
-                        // Contrainte unique partielle (voir schema-diff.md) : si une course a laissé passer
-                        // deux ventes à crédit simultanées, celle-ci échoue ici avec le code Postgres 23505.
-                        await tx.credit.create({
-                            data: {
+            await prisma_1.prisma.$transaction(async (tx) => {
+                const produit = await tx.produit.findUnique({ where: { id: p.produitId } });
+                if (!produit)
+                    throw new SyncError('Produit introuvable.');
+                if (Number(produit.quantiteStock) < quantite) {
+                    throw new SyncError(`Stock insuffisant (${produit.quantiteStock} restant, ${quantite} demandé).`);
+                }
+                // ---------- Règle de crédit selon l'activité ----------
+                if (p.modePaiement === 'CREDIT') {
+                    const activite = await tx.activite.findUnique({ where: { id: p.activiteId } });
+                    if (activite && estEssence(activite.nom)) {
+                        const ouverts = await tx.credit.findMany({
+                            where: {
                                 clientId: p.clientId,
                                 activiteId: p.activiteId,
-                                venteId: id,
-                                montantInitial: montant,
-                                montantRestant: montant,
+                                statut: 'EN_COURS',
+                                deletedAt: null,
                             },
                         });
+                        if (ouverts.length > 0) {
+                            const initial = ouverts.reduce((s, c) => s + Number(c.montantInitial), 0);
+                            const rembourse = ouverts.reduce((s, c) => s + Number(c.montantRembourse), 0);
+                            if (rembourse < initial * SEUIL_REMBOURSEMENT_ESSENCE) {
+                                throw new SyncError(`Ce client doit d'abord rembourser au moins 50 % de son crédit ` +
+                                    `(remboursé : ${rembourse} sur ${initial}).`);
+                            }
+                        }
                     }
-                    else {
-                        await tx.mouvementCaisse.create({
-                            data: {
-                                activiteId: p.activiteId,
-                                venteId: id,
-                                saisiParId: userId,
-                                type: 'ENTREE',
-                                montant,
-                                motif: 'Vente',
-                            },
-                        });
-                    }
-                });
-            }
-            catch (e) {
-                if (e instanceof client_1.Prisma.PrismaClientKnownRequestError && e.code === '23505') {
-                    throw new SyncError('Ce client a déjà un emprunt en cours sur cette activité (détecté à la validation finale).');
                 }
-                throw e;
-            }
+                await tx.produit.update({
+                    where: { id: p.produitId },
+                    data: { quantiteStock: { decrement: quantite } },
+                });
+                await tx.vente.create({
+                    data: {
+                        id,
+                        activiteId: p.activiteId,
+                        clientId: p.clientId,
+                        produitId: p.produitId,
+                        saisiParId: userId,
+                        quantite,
+                        montant,
+                        modePaiement: p.modePaiement,
+                        date: p.date ? new Date(p.date) : new Date(),
+                    },
+                });
+                if (p.modePaiement === 'CREDIT') {
+                    await tx.credit.create({
+                        data: {
+                            id, // même id que la vente : la ligne créée hors ligne sur le téléphone n'est pas dupliquée au pull
+                            clientId: p.clientId,
+                            activiteId: p.activiteId,
+                            venteId: id,
+                            montantInitial: montant,
+                            montantRestant: montant,
+                        },
+                    });
+                }
+                else {
+                    await tx.mouvementCaisse.create({
+                        data: {
+                            activiteId: p.activiteId,
+                            venteId: id,
+                            saisiParId: userId,
+                            type: 'ENTREE',
+                            montant,
+                            motif: 'Vente',
+                        },
+                    });
+                }
+            });
+        },
+        // Suppression : stock remis, caisse compensée (comptant), crédit annulé (crédit).
+        // Idempotent : rejouer l'opération sur une vente déjà supprimée ne fait rien.
+        async delete(id, _p, userId) {
+            await prisma_1.prisma.$transaction(async (tx) => {
+                const vente = await tx.vente.findUnique({
+                    where: { id },
+                    include: { credit: true, mouvementCaisse: true },
+                });
+                if (!vente || vente.deletedAt)
+                    return;
+                if (vente.credit && Number(vente.credit.montantRembourse) > 0) {
+                    throw new SyncError('Suppression refusée : ce crédit a déjà été remboursé en partie.');
+                }
+                await tx.produit.update({
+                    where: { id: vente.produitId },
+                    data: {
+                        quantiteStock: { increment: Number(vente.quantite) },
+                        sessionTerminee: false,
+                        dateFinSession: null,
+                    },
+                });
+                if (vente.modePaiement === 'COMPTANT' && vente.mouvementCaisse) {
+                    await tx.mouvementCaisse.create({
+                        data: {
+                            activiteId: vente.activiteId,
+                            saisiParId: userId,
+                            type: 'SORTIE',
+                            montant: vente.montant,
+                            motif: `Annulation vente ${vente.id}`,
+                            categorie: 'ANNULATION_VENTE',
+                        },
+                    });
+                }
+                // statut SOLDE + restant 0 : même une requête qui ne filtre pas deletedAt l'ignore.
+                if (vente.credit) {
+                    await tx.credit.update({
+                        where: { id: vente.credit.id },
+                        data: { deletedAt: new Date(), statut: 'SOLDE', montantRestant: 0 },
+                    });
+                }
+                await tx.vente.update({ where: { id }, data: { deletedAt: new Date() } });
+                await tx.auditLog.create({
+                    data: {
+                        utilisateurId: userId,
+                        action: 'SUPPRESSION_VENTE',
+                        entite: 'Vente',
+                        entiteId: id,
+                        details: {
+                            modePaiement: vente.modePaiement,
+                            montant: Number(vente.montant),
+                            quantite: Number(vente.quantite),
+                        },
+                    },
+                });
+            });
         },
     },
     credits: {
@@ -200,7 +272,7 @@ const handlers = {
                 throw new SyncError('Montant de remboursement invalide.');
             await prisma_1.prisma.$transaction(async (tx) => {
                 const credit = await tx.credit.findUnique({ where: { id: creditId } });
-                if (!credit)
+                if (!credit || credit.deletedAt)
                     throw new SyncError('Crédit introuvable.');
                 if (credit.statut === 'SOLDE')
                     throw new SyncError('Ce crédit est déjà soldé.');
@@ -368,7 +440,7 @@ router.post('/push', async (req, res, next) => {
                 results.push({ opId: o.opId, ok: true });
             }
             catch (e) {
-                console.error('SYNC PUSH ERREUR', o.entity, o.op, e); // ← AJOUTE CETTE LIGNE
+                console.error('SYNC PUSH ERREUR', o.entity, o.op, e);
                 const msg = messageMetier(e);
                 if (msg === null)
                     throw e; // erreur technique → 500 → le mobile réessaiera
@@ -401,7 +473,6 @@ async function activiteIdsAccessibles(user) {
 // ---------- PULL ----------
 router.get('/pull', async (req, res, next) => {
     try {
-        const userId = req.user.id;
         const serverTime = new Date();
         const sinceRaw = typeof req.query.since === 'string' ? new Date(req.query.since) : null;
         const since = sinceRaw && !isNaN(sinceRaw.getTime()) ? sinceRaw : null;
@@ -424,7 +495,9 @@ router.get('/pull', async (req, res, next) => {
             prisma_1.prisma.produit.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
             prisma_1.prisma.vente.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
             prisma_1.prisma.credit.findMany({
-                where: since ? { updatedAt: { gt: since }, activiteId: { in: activiteIds } } : { activiteId: { in: activiteIds } },
+                where: since
+                    ? { updatedAt: { gt: since }, activiteId: { in: activiteIds } }
+                    : { deletedAt: null, activiteId: { in: activiteIds } },
                 orderBy: { updatedAt: 'asc' },
             }),
             prisma_1.prisma.mouvementCaisse.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),

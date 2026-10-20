@@ -1,120 +1,83 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.creerVente = creerVente;
+exports.supprimerVente = supprimerVente;
 exports.listerVentes = listerVentes;
 exports.obtenirVente = obtenirVente;
 const prisma_1 = require("../../lib/prisma");
 const errorHandler_1 = require("../../middlewares/errorHandler");
+// Essence : un seul crédit ouvert par client, sauf si 50 % ont été remboursés.
+const SEUIL_REMBOURSEMENT_ESSENCE = 0.5;
+function estEssence(nom) {
+    return nom
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .includes("essence");
+}
 /**
  * Crée une vente.
- *
- * Le montant est calculé automatiquement
- * à partir du prix de vente du produit :
- *
- * montant = prixUnitaire × quantite
- *
- * Le montant envoyé éventuellement par le
- * frontend est donc totalement ignoré.
+ * Le montant est calculé côté serveur : prixUnitaire × quantite.
  */
 async function creerVente(input) {
-    const { activiteId, clientId, produitId, saisiParId, quantite, modePaiement, } = input;
+    const { activiteId, clientId, produitId, saisiParId, quantite, modePaiement } = input;
     return prisma_1.prisma.$transaction(async (tx) => {
-        // ==========================================
-        // VÉRIFICATION DU PRODUIT
-        // ==========================================
-        const produit = await tx.produit.findUnique({
-            where: {
-                id: produitId,
-            },
-        });
-        if (!produit) {
+        // ---------- Produit ----------
+        const produit = await tx.produit.findUnique({ where: { id: produitId } });
+        if (!produit)
             throw new errorHandler_1.AppError("Produit introuvable.", 404);
-        }
-        // ==========================================
-        // VÉRIFICATION ACTIVITÉ
-        // ==========================================
-        if (produit.activiteId !==
-            activiteId) {
+        if (produit.activiteId !== activiteId) {
             throw new errorHandler_1.AppError("Ce produit n'appartient pas à cette activité.", 400);
         }
-        // ==========================================
-        // VÉRIFICATION SESSION
-        // ==========================================
         if (produit.sessionTerminee) {
             throw new errorHandler_1.AppError(`La session du produit "${produit.nom}" est déjà terminée.`, 400);
         }
-        // ==========================================
-        // QUANTITÉ
-        // ==========================================
+        // ---------- Quantité / stock ----------
         const stockDisponible = Number(produit.quantiteStock);
         const quantiteDemandee = Number(quantite);
-        if (!Number.isFinite(quantiteDemandee)) {
+        if (!Number.isFinite(quantiteDemandee))
             throw new errorHandler_1.AppError("La quantité est invalide.", 400);
-        }
-        if (quantiteDemandee <= 0) {
+        if (quantiteDemandee <= 0)
             throw new errorHandler_1.AppError("La quantité doit être supérieure à 0.", 400);
-        }
-        // ==========================================
-        // STOCK ÉPUISÉ
-        // ==========================================
         if (stockDisponible <= 0) {
             throw new errorHandler_1.AppError(`Stock épuisé. Le produit "${produit.nom}" n'est plus disponible à la vente.`, 400);
         }
-        // ==========================================
-        // STOCK INSUFFISANT
-        // ==========================================
-        if (quantiteDemandee >
-            stockDisponible) {
+        if (quantiteDemandee > stockDisponible) {
             throw new errorHandler_1.AppError(`Stock insuffisant pour "${produit.nom}". ` +
-                `Stock disponible : ${stockDisponible}. ` +
-                `Quantité demandée : ${quantiteDemandee}.`, 400);
+                `Stock disponible : ${stockDisponible}. Quantité demandée : ${quantiteDemandee}.`, 400);
         }
-        // ==========================================
-        // PRIX DE VENTE
-        // ==========================================
+        // ---------- Prix / montant ----------
         const prixVenteUnitaire = Number(produit.prixUnitaire);
-        if (!Number.isFinite(prixVenteUnitaire) ||
-            prixVenteUnitaire <= 0) {
+        if (!Number.isFinite(prixVenteUnitaire) || prixVenteUnitaire <= 0) {
             throw new errorHandler_1.AppError(`Le produit "${produit.nom}" n'a pas de prix de vente valide.`, 400);
         }
-        // ==========================================
-        // CALCUL AUTOMATIQUE DU MONTANT
-        // ==========================================
-        const montant = prixVenteUnitaire *
-            quantiteDemandee;
-        if (!Number.isFinite(montant) ||
-            montant <= 0) {
+        const montant = prixVenteUnitaire * quantiteDemandee;
+        if (!Number.isFinite(montant) || montant <= 0) {
             throw new errorHandler_1.AppError("Le montant calculé de la vente est invalide.", 400);
         }
-        // ==========================================
-        // NOUVEAU STOCK
-        // ==========================================
-        const nouveauStock = stockDisponible -
-            quantiteDemandee;
+        const nouveauStock = stockDisponible - quantiteDemandee;
         if (nouveauStock < 0) {
             throw new errorHandler_1.AppError("La vente ne peut pas être effectuée : le stock ne peut pas être négatif.", 400);
         }
-        // ==========================================
-        // VÉRIFICATION DU CRÉDIT
-        // ==========================================
-        if (modePaiement ===
-            "CREDIT") {
-            const creditExistant = await tx.credit.findFirst({
-                where: {
-                    clientId,
-                    activiteId,
-                    statut: "EN_COURS",
-                },
-            });
-            if (creditExistant) {
-                throw new errorHandler_1.AppError(`Ce client a déjà un emprunt en cours sur cette activité ` +
-                    `(reste ${creditExistant.montantRestant} à rembourser). ` +
-                    `Impossible de créer un nouvel emprunt tant qu'il n'est pas soldé.`, 409);
+        // ---------- Contrôle du crédit ----------
+        if (modePaiement === "CREDIT") {
+            const activite = await tx.activite.findUnique({ where: { id: activiteId } });
+            if (activite && estEssence(activite.nom)) {
+                const ouverts = await tx.credit.findMany({
+                    where: { clientId, activiteId, statut: "EN_COURS", deletedAt: null },
+                });
+                if (ouverts.length > 0) {
+                    const initial = ouverts.reduce((s, c) => s + Number(c.montantInitial), 0);
+                    const rembourse = ouverts.reduce((s, c) => s + Number(c.montantRembourse), 0);
+                    if (rembourse < initial * SEUIL_REMBOURSEMENT_ESSENCE) {
+                        throw new errorHandler_1.AppError(`Ce client doit d'abord rembourser au moins 50 % de son crédit ` +
+                            `(remboursé : ${rembourse} sur ${initial}).`, 409);
+                    }
+                }
             }
+            // Bateau Vente Poisson et autres activités : pas de limite.
         }
-        // ==========================================
-        // CRÉATION DE LA VENTE
-        // ==========================================
+        // ---------- Création de la vente ----------
         const vente = await tx.vente.create({
             data: {
                 activiteId,
@@ -122,32 +85,19 @@ async function creerVente(input) {
                 produitId,
                 saisiParId,
                 quantite: quantiteDemandee,
-                // IMPORTANT :
-                // montant calculé côté serveur
                 montant,
                 modePaiement,
             },
         });
-        // ==========================================
-        // DÉCRÉMENTATION DU STOCK
-        // ==========================================
         await tx.produit.update({
-            where: {
-                id: produitId,
-            },
+            where: { id: produitId },
             data: {
                 quantiteStock: nouveauStock,
                 sessionTerminee: nouveauStock === 0,
-                dateFinSession: nouveauStock === 0
-                    ? new Date()
-                    : null,
+                dateFinSession: nouveauStock === 0 ? new Date() : null,
             },
         });
-        // ==========================================
-        // PAIEMENT COMPTANT
-        // ==========================================
-        if (modePaiement ===
-            "COMPTANT") {
+        if (modePaiement === "COMPTANT") {
             await tx.mouvementCaisse.create({
                 data: {
                     activiteId,
@@ -159,9 +109,6 @@ async function creerVente(input) {
                 },
             });
         }
-        // ==========================================
-        // PAIEMENT À CRÉDIT
-        // ==========================================
         else {
             await tx.credit.create({
                 data: {
@@ -175,9 +122,6 @@ async function creerVente(input) {
                 },
             });
         }
-        // ==========================================
-        // AUDIT
-        // ==========================================
         await tx.auditLog.create({
             data: {
                 utilisateurId: saisiParId,
@@ -198,24 +142,93 @@ async function creerVente(input) {
     });
 }
 /**
- * Liste les ventes d'une activité.
+ * Supprime (annule) une vente :
+ *  - le stock du produit est remis ;
+ *  - comptant : une SORTIE de caisse du même montant compense l'ENTREE d'origine ;
+ *  - crédit   : le crédit est supprimé (refusé s'il a déjà été remboursé en partie).
+ * La vente est conservée en base (deletedAt) pour l'historique et la synchronisation.
+ */
+async function supprimerVente(id, utilisateurId) {
+    return prisma_1.prisma.$transaction(async (tx) => {
+        const vente = await tx.vente.findUnique({
+            where: { id },
+            include: { credit: true, mouvementCaisse: true },
+        });
+        if (!vente)
+            throw new errorHandler_1.AppError("Vente introuvable.", 404);
+        if (vente.deletedAt)
+            return vente; // déjà supprimée : on répond OK (appel rejoué par la synchro)
+        if (vente.credit && Number(vente.credit.montantRembourse) > 0) {
+            throw new errorHandler_1.AppError("Suppression impossible : ce crédit a déjà été remboursé en partie.", 400);
+        }
+        // ---------- Stock ----------
+        const produit = await tx.produit.findUnique({ where: { id: vente.produitId } });
+        if (!produit)
+            throw new errorHandler_1.AppError("Produit introuvable.", 404);
+        const stockApres = Number(produit.quantiteStock) + Number(vente.quantite);
+        await tx.produit.update({
+            where: { id: vente.produitId },
+            data: {
+                quantiteStock: stockApres,
+                sessionTerminee: false,
+                dateFinSession: null,
+            },
+        });
+        // ---------- Caisse (comptant) ----------
+        if (vente.modePaiement === "COMPTANT" && vente.mouvementCaisse) {
+            await tx.mouvementCaisse.create({
+                data: {
+                    activiteId: vente.activiteId,
+                    saisiParId: utilisateurId,
+                    type: "SORTIE",
+                    montant: vente.montant,
+                    motif: `Annulation vente ${vente.id}`,
+                    categorie: "ANNULATION_VENTE",
+                },
+            });
+        }
+        // ---------- Crédit ----------
+        // statut SOLDE + restant 0 : même une requête qui ne filtre pas deletedAt l'ignore.
+        if (vente.credit) {
+            await tx.credit.update({
+                where: { id: vente.credit.id },
+                data: { deletedAt: new Date(), statut: "SOLDE", montantRestant: 0 },
+            });
+        }
+        // ---------- Vente ----------
+        const supprimee = await tx.vente.update({
+            where: { id },
+            data: { deletedAt: new Date() },
+        });
+        await tx.auditLog.create({
+            data: {
+                utilisateurId: utilisateurId,
+                action: "SUPPRESSION_VENTE",
+                entite: "Vente",
+                entiteId: id,
+                details: {
+                    modePaiement: vente.modePaiement,
+                    montant: Number(vente.montant),
+                    quantite: Number(vente.quantite),
+                    stockApres,
+                },
+            },
+        });
+        return supprimee;
+    });
+}
+/**
+ * Liste les ventes d'une activité (hors ventes supprimées).
  */
 function listerVentes(activiteId, clientId) {
     return prisma_1.prisma.vente.findMany({
         where: {
             activiteId,
-            ...(clientId
-                ? { clientId }
-                : {}),
+            deletedAt: null,
+            ...(clientId ? { clientId } : {}),
         },
-        orderBy: {
-            date: "desc",
-        },
-        include: {
-            client: true,
-            produit: true,
-            activite: true
-        },
+        orderBy: { date: "desc" },
+        include: { client: true, produit: true, activite: true },
     });
 }
 /**
@@ -223,15 +236,8 @@ function listerVentes(activiteId, clientId) {
  */
 function obtenirVente(id) {
     return prisma_1.prisma.vente.findUniqueOrThrow({
-        where: {
-            id,
-        },
-        include: {
-            client: true,
-            produit: true,
-            credit: true,
-            mouvementCaisse: true,
-        },
+        where: { id },
+        include: { client: true, produit: true, credit: true, mouvementCaisse: true },
     });
 }
 //# sourceMappingURL=ventes.service.js.map

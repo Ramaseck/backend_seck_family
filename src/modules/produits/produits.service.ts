@@ -314,6 +314,7 @@ export async function obtenirBilanProduit(
         },
 
         ventes: {
+           where: { deletedAt: null }, 
           orderBy: {
             date: "desc",
           },

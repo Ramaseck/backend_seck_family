@@ -175,6 +175,7 @@ async function obtenirBilanProduit(produitId) {
                 },
             },
             ventes: {
+                where: { deletedAt: null },
                 orderBy: {
                     date: "desc",
                 },

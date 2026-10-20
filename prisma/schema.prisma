@@ -156,6 +156,7 @@ model Credit {
   statut           StatutCredit    @default(EN_COURS)
   dateEmprunt      DateTime        @default(now())
   dateSolde        DateTime?
+  deletedAt        DateTime?
   updatedAt        DateTime        @updatedAt
   activite         Activite        @relation(fields: [activiteId], references: [id])
   client           Client          @relation(fields: [clientId], references: [id])
