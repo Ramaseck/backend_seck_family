@@ -11,6 +11,5 @@ router.post("/", requireAuth, creer);
 router.put("/:id", requireAuth, modifier);
 router.delete("/batch", requireAuth, supprimerPlusieurs); // route déclarée avant /:id
 router.delete("/:id", requireAuth, supprimer);
-router.delete("/:id", requireAuth, supprimer);
-
+ 
 export default router;
