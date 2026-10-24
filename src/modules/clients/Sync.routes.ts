@@ -3,6 +3,8 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';            // ← adapte le chemin
 import { requireAuth } from '../../middlewares/auth';  // ← adapte le chemin
 
+console.log('SYNC ROUTER v2 chargé');
+
 const router = Router();
 router.use(requireAuth);
 
@@ -60,22 +62,67 @@ const handlers: Record<string, Record<string, (id: string, payload: any, userId:
     },
   },
 
+  // Produit (article) : un nom par activité. Il contient des sessions (table "produits").
+  articles: {
+    async upsert(id, p) {
+      const activiteId = String(p.activiteId || '');
+      const nom = String(p.nom ?? '').trim();
+      if (!activiteId) throw new SyncError('Activité requise.');
+      if (!nom) throw new SyncError('Le nom du produit est requis.');
+
+      const doublon = await prisma.article.findFirst({
+        where: {
+          activiteId,
+          deletedAt: null,
+          id: { not: id },
+          nom: { equals: nom, mode: 'insensitive' },
+        },
+      });
+      if (doublon) throw new SyncError(`Le produit « ${nom} » existe déjà dans cette activité.`);
+
+      await prisma.$transaction(async (tx) => {
+        await tx.article.upsert({
+          where: { id },
+          create: { id, activiteId, nom },
+          update: { nom, deletedAt: null },
+        });
+        // Le nom est recopié sur chaque session (ventes, crédits et bilans l'utilisent).
+        await tx.produit.updateMany({ where: { articleId: id }, data: { nom } });
+      });
+    },
+  },
+
+  // "produits" = SESSIONS d'un article.
   produits: {
     // Création uniquement (pas de modifierProduit côté mobile) : idempotent via l'id.
-    // Le numéro de session est attribué ICI, jamais côté mobile, pour éviter les collisions
-    // entre deux sessions créées hors ligne sur des appareils différents.
+    // Le numéro de session est attribué ICI (par article), jamais côté mobile, pour éviter
+    // les collisions entre deux sessions créées hors ligne sur des appareils différents.
     async upsert(id, p) {
       const existant = await prisma.produit.findUnique({ where: { id } });
       if (existant) return; // rejoué : déjà appliqué, on ne réattribue pas de numéro
 
-      const activiteId = String(p.activiteId || '');
       const prixUnitaire = Number(p.prixUnitaire);
-      if (!activiteId) throw new SyncError('Activité requise.');
       if (!prixUnitaire || prixUnitaire <= 0) throw new SyncError('Prix de vente invalide.');
 
       await prisma.$transaction(async (tx) => {
+        let article;
+        if (p.articleId) {
+          article = await tx.article.findUnique({ where: { id: String(p.articleId) } });
+          if (!article) throw new SyncError('Produit parent introuvable.');
+        } else {
+          // Anciens téléphones : on retrouve ou on crée le produit à partir de son nom.
+          const activiteId = String(p.activiteId || '');
+          const nom = String(p.nom ?? '').trim() || 'Produit';
+          if (!activiteId) throw new SyncError('Activité requise.');
+          article = await tx.article.upsert({
+            where: { activiteId_nom: { activiteId, nom } },
+            create: { activiteId, nom },
+            update: {},
+          });
+        }
+
         const dernier = await tx.produit.aggregate({
-          where: { activiteId },
+          where: { articleId: article.id },
           _max: { numeroSession: true },
         });
         const numeroSession = (dernier._max.numeroSession ?? 0) + 1;
@@ -83,9 +130,10 @@ const handlers: Record<string, Record<string, (id: string, payload: any, userId:
         await tx.produit.create({
           data: {
             id,
-            activiteId,
+            activiteId: article.activiteId,
+            articleId: article.id,
             numeroSession,
-            nom: p.nom ? String(p.nom).trim() : null,
+            nom: article.nom,
             quantiteStock: p.quantiteStock ?? 0,
             quantiteInitiale: p.quantiteInitiale ?? 0,
             prixAchatUnitaire: p.prixAchatUnitaire ?? 0,
@@ -462,6 +510,8 @@ router.post('/push', async (req, res, next) => {
     const operations: Operation[] = Array.isArray(req.body?.operations)
       ? req.body.operations.slice(0, 100)
       : [];
+    console.log('PUSH reçu par CE serveur:', operations.map((o) => `${o.entity}.${o.op}`));
+
     const results: { opId: string; ok: boolean; message?: string }[] = [];
 
     for (const o of operations) {
@@ -521,7 +571,7 @@ router.get('/pull', async (req, res, next) => {
       ? { updatedAt: { gt: since }, activiteId: { in: activiteIds } }
       : { deletedAt: null, activiteId: { in: activiteIds } };
 
-    const [clients, activites, produits, ventes, credits, mouvementsCaisse, financements] =
+    const [clients, activites, articles, produits, ventes, credits, mouvementsCaisse, financements] =
       await Promise.all([
         prisma.client.findMany({ where, orderBy: { updatedAt: 'asc' } }),
         prisma.activite.findMany({
@@ -530,6 +580,7 @@ router.get('/pull', async (req, res, next) => {
             : { id: { in: activiteIds } },
           orderBy: { updatedAt: 'asc' },
         }),
+        prisma.article.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
         prisma.produit.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
         prisma.vente.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
         prisma.credit.findMany({
@@ -546,6 +597,7 @@ router.get('/pull', async (req, res, next) => {
       serverTime: new Date(serverTime.getTime() - 5000).toISOString(),
       clients,
       activites,
+      articles,
       produits,
       ventes,
       credits,

@@ -24,6 +24,7 @@ model Activite {
   produits         Produit[]
   utilisateurs     UtilisateurActivite[]
   ventes           Vente[]
+  articles    Article[]
 
   @@index([updatedAt])
   @@map("activites")
@@ -115,7 +116,11 @@ model Produit {
   activite          Activite           @relation(fields: [activiteId], references: [id])
   ventes            Vente[]
 
-  @@unique([activiteId, numeroSession])
+ articleId  String?
+article    Article? @relation(fields: [articleId], references: [id])
+
+  @@unique([articleId, numeroSession])
+  @@index([activiteId])
   @@index([updatedAt])
   @@map("produits")
 }
@@ -230,6 +235,20 @@ model Financement {
   @@index([updatedAt])
   @@index([activiteId, statut])
   @@map("financements")
+}
+model Article {
+  id         String    @id @default(uuid())
+  activiteId String
+  nom        String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+  activite   Activite  @relation(fields: [activiteId], references: [id])
+  sessions   Produit[]
+
+  @@unique([activiteId, nom])
+  @@index([updatedAt])
+  @@map("articles")
 }
 
 model RemboursementFinancement {
