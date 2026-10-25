@@ -26,6 +26,7 @@ model Activite {
   ventes           Vente[]
   articles    Article[]
   clients  Client[]
+  releves ReleveCompteur[]
 
   @@index([updatedAt])
   @@map("activites")
@@ -99,6 +100,26 @@ model AchatProduit {
   @@map("achats_produit")
 }
 
+model ReleveCompteur {
+  id         String    @id @default(uuid())
+  activiteId String
+  produitId  String
+  pompe      String    @default("Pompe 1")
+  indexDebut Decimal
+  indexFin   Decimal?
+  dateDebut  DateTime  @default(now())
+  dateFin    DateTime?
+  saisiParId String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+  activite   Activite  @relation(fields: [activiteId], references: [id])
+  produit    Produit   @relation(fields: [produitId], references: [id])
+
+  @@index([updatedAt])
+  @@index([activiteId, dateDebut])
+  @@map("releves_compteur")
+}
 model Produit {
   id                String             @id @default(uuid())
   activiteId        String
@@ -120,6 +141,7 @@ model Produit {
   lignesBonCommande LigneBonCommande[]
   activite          Activite           @relation(fields: [activiteId], references: [id])
   ventes            Vente[]
+  releves ReleveCompteur[]
 
  articleId  String?
 article    Article? @relation(fields: [articleId], references: [id])

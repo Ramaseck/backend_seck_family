@@ -181,6 +181,37 @@ const handlers = {
             });
         },
     },
+    releves_compteur: {
+        async upsert(id, p, userId) {
+            const activiteId = String(p.activiteId || '');
+            const produitId = String(p.produitId || '');
+            const indexDebut = Number(p.indexDebut);
+            const indexFin = p.indexFin === null || p.indexFin === undefined || p.indexFin === '' ? null : Number(p.indexFin);
+            if (!activiteId || !produitId)
+                throw new SyncError('Activité et session requises.');
+            if (!Number.isFinite(indexDebut) || indexDebut < 0)
+                throw new SyncError("Index de début invalide.");
+            if (indexFin !== null && (!Number.isFinite(indexFin) || indexFin < indexDebut)) {
+                throw new SyncError("L'index de fin doit être supérieur ou égal à l'index de début.");
+            }
+            const produit = await prisma_1.prisma.produit.findUnique({ where: { id: produitId } });
+            if (!produit || produit.activiteId !== activiteId) {
+                throw new SyncError('Session introuvable pour cette activité.');
+            }
+            const pompe = String(p.pompe || 'Pompe 1').trim();
+            const dateFin = p.dateFin ? new Date(p.dateFin) : null;
+            await prisma_1.prisma.releveCompteur.upsert({
+                where: { id },
+                create: {
+                    id, activiteId, produitId, pompe, indexDebut, indexFin,
+                    dateDebut: p.dateDebut ? new Date(p.dateDebut) : new Date(),
+                    dateFin,
+                    saisiParId: userId,
+                },
+                update: { pompe, indexDebut, indexFin, dateFin, deletedAt: null },
+            });
+        },
+    },
     ventes: {
         // Une vente = vente + (crédit OU mouvement de caisse) + décrément du stock,
         // dans UNE seule transaction. Idempotent via l'id (une vente n'est jamais modifiée).
@@ -559,7 +590,7 @@ router.get('/pull', async (req, res, next) => {
         const whereActivite = since
             ? { updatedAt: { gt: since }, activiteId: { in: activiteIds } }
             : { deletedAt: null, activiteId: { in: activiteIds } };
-        const [clients, activites, articles, produits, ventes, credits, mouvementsCaisse, financements] = await Promise.all([
+        const [clients, activites, articles, produits, ventes, credits, mouvementsCaisse, financements, releves] = await Promise.all([
             prisma_1.prisma.client.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
             prisma_1.prisma.activite.findMany({
                 where: since
@@ -578,6 +609,7 @@ router.get('/pull', async (req, res, next) => {
             }),
             prisma_1.prisma.mouvementCaisse.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
             prisma_1.prisma.financement.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
+            prisma_1.prisma.releveCompteur.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
         ]);
         res.json({
             serverTime: new Date(serverTime.getTime() - 5000).toISOString(),
@@ -589,6 +621,7 @@ router.get('/pull', async (req, res, next) => {
             credits,
             mouvements_caisse: mouvementsCaisse,
             financements,
+            releves_compteur: releves,
         });
     }
     catch (e) {
