@@ -225,7 +225,7 @@ const handlers: Record<string, Record<string, (id: string, payload: any, userId:
           throw new SyncError('Ce client appartient à une autre activité.');
         }
         // ---------- Règle de crédit selon l'activité ----------
-        if (p.modePaiement === 'CREDIT') {
+      /*   if (p.modePaiement === 'CREDIT') {
           const activite = await tx.activite.findUnique({ where: { id: p.activiteId } });
 
           if (activite && estEssence(activite.nom)) {
@@ -250,7 +250,7 @@ const handlers: Record<string, Record<string, (id: string, payload: any, userId:
               }
             }
           }
-        }
+        } */
 
         await tx.produit.update({
           where: { id: p.produitId },

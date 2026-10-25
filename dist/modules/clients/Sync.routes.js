@@ -211,27 +211,32 @@ const handlers = {
                     throw new SyncError('Ce client appartient à une autre activité.');
                 }
                 // ---------- Règle de crédit selon l'activité ----------
-                if (p.modePaiement === 'CREDIT') {
+                /*   if (p.modePaiement === 'CREDIT') {
                     const activite = await tx.activite.findUnique({ where: { id: p.activiteId } });
+          
                     if (activite && estEssence(activite.nom)) {
-                        const ouverts = await tx.credit.findMany({
-                            where: {
-                                clientId: p.clientId,
-                                activiteId: p.activiteId,
-                                statut: 'EN_COURS',
-                                deletedAt: null,
-                            },
-                        });
-                        if (ouverts.length > 0) {
-                            const initial = ouverts.reduce((s, c) => s + Number(c.montantInitial), 0);
-                            const rembourse = ouverts.reduce((s, c) => s + Number(c.montantRembourse), 0);
-                            if (rembourse < initial * SEUIL_REMBOURSEMENT_ESSENCE) {
-                                throw new SyncError(`Ce client doit d'abord rembourser au moins 50 % de son crédit ` +
-                                    `(remboursé : ${rembourse} sur ${initial}).`);
-                            }
+                      const ouverts = await tx.credit.findMany({
+                        where: {
+                          clientId: p.clientId,
+                          activiteId: p.activiteId,
+                          statut: 'EN_COURS',
+                          deletedAt: null,
+                        },
+                      });
+          
+                      if (ouverts.length > 0) {
+                        const initial = ouverts.reduce((s, c) => s + Number(c.montantInitial), 0);
+                        const rembourse = ouverts.reduce((s, c) => s + Number(c.montantRembourse), 0);
+          
+                        if (rembourse < initial * SEUIL_REMBOURSEMENT_ESSENCE) {
+                          throw new SyncError(
+                            `Ce client doit d'abord rembourser au moins 50 % de son crédit ` +
+                              `(remboursé : ${rembourse} sur ${initial}).`
+                          );
                         }
+                      }
                     }
-                }
+                  } */
                 await tx.produit.update({
                     where: { id: p.produitId },
                     data: { quantiteStock: { decrement: quantite } },
