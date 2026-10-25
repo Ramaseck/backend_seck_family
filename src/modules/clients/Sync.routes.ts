@@ -37,14 +37,29 @@ type Operation = {
 // (le push la renvoie telle quelle au mobile), ou toute autre erreur pour un vrai échec technique
 // (le mobile réessaiera plus tard, rien n'est marqué "refusé").
 const handlers: Record<string, Record<string, (id: string, payload: any, userId: string) => Promise<void>>> = {
-  clients: {
+   clients: {
     async upsert(id, p) {
       const nom = String(p.nom ?? '').trim();
-      if (!nom) throw new SyncError('Le nom du client est requis.');
       const contact = p.contact ? String(p.contact).trim() : null;
+      const activiteId = String(p.activiteId || '');
+      if (!nom) throw new SyncError('Le nom du client est requis.');
+      if (!activiteId) throw new SyncError("Activité requise pour le client. Mettez l'application à jour.");
+
+      const doublonNom = await prisma.client.findFirst({
+        where: { activiteId, deletedAt: null, id: { not: id }, nom: { equals: nom, mode: 'insensitive' } },
+      });
+      if (doublonNom) throw new SyncError('Un client avec ce nom existe déjà dans cette activité.');
+
+      if (contact) {
+        const doublonContact = await prisma.client.findFirst({
+          where: { activiteId, deletedAt: null, id: { not: id }, contact },
+        });
+        if (doublonContact) throw new SyncError('Un client avec ce contact existe déjà dans cette activité.');
+      }
+
       await prisma.client.upsert({
         where: { id },
-        create: { id, nom, contact },
+        create: { id, activiteId, nom, contact },
         update: { nom, contact, deletedAt: null },
       });
     },
@@ -204,6 +219,11 @@ const handlers: Record<string, Record<string, (id: string, payload: any, userId:
           );
         }
 
+                const client = await tx.client.findUnique({ where: { id: p.clientId } });
+        if (!client) throw new SyncError('Client introuvable.');
+        if (client.activiteId && client.activiteId !== p.activiteId) {
+          throw new SyncError('Ce client appartient à une autre activité.');
+        }
         // ---------- Règle de crédit selon l'activité ----------
         if (p.modePaiement === 'CREDIT') {
           const activite = await tx.activite.findUnique({ where: { id: p.activiteId } });
@@ -573,8 +593,8 @@ router.get('/pull', async (req, res, next) => {
 
     const [clients, activites, articles, produits, ventes, credits, mouvementsCaisse, financements] =
       await Promise.all([
-        prisma.client.findMany({ where, orderBy: { updatedAt: 'asc' } }),
-        prisma.activite.findMany({
+        prisma.client.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
+                prisma.activite.findMany({
           where: since
             ? { updatedAt: { gt: since }, id: { in: activiteIds } }
             : { id: { in: activiteIds } },

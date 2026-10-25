@@ -28,12 +28,27 @@ const handlers = {
     clients: {
         async upsert(id, p) {
             const nom = String(p.nom ?? '').trim();
+            const contact = p.contact ? String(p.contact).trim() : null;
+            const activiteId = String(p.activiteId || '');
             if (!nom)
                 throw new SyncError('Le nom du client est requis.');
-            const contact = p.contact ? String(p.contact).trim() : null;
+            if (!activiteId)
+                throw new SyncError("Activité requise pour le client. Mettez l'application à jour.");
+            const doublonNom = await prisma_1.prisma.client.findFirst({
+                where: { activiteId, deletedAt: null, id: { not: id }, nom: { equals: nom, mode: 'insensitive' } },
+            });
+            if (doublonNom)
+                throw new SyncError('Un client avec ce nom existe déjà dans cette activité.');
+            if (contact) {
+                const doublonContact = await prisma_1.prisma.client.findFirst({
+                    where: { activiteId, deletedAt: null, id: { not: id }, contact },
+                });
+                if (doublonContact)
+                    throw new SyncError('Un client avec ce contact existe déjà dans cette activité.');
+            }
             await prisma_1.prisma.client.upsert({
                 where: { id },
-                create: { id, nom, contact },
+                create: { id, activiteId, nom, contact },
                 update: { nom, contact, deletedAt: null },
             });
         },
@@ -188,6 +203,12 @@ const handlers = {
                     throw new SyncError('Produit introuvable.');
                 if (Number(produit.quantiteStock) < quantite) {
                     throw new SyncError(`Stock insuffisant (${produit.quantiteStock} restant, ${quantite} demandé).`);
+                }
+                const client = await tx.client.findUnique({ where: { id: p.clientId } });
+                if (!client)
+                    throw new SyncError('Client introuvable.');
+                if (client.activiteId && client.activiteId !== p.activiteId) {
+                    throw new SyncError('Ce client appartient à une autre activité.');
                 }
                 // ---------- Règle de crédit selon l'activité ----------
                 if (p.modePaiement === 'CREDIT') {
@@ -534,7 +555,7 @@ router.get('/pull', async (req, res, next) => {
             ? { updatedAt: { gt: since }, activiteId: { in: activiteIds } }
             : { deletedAt: null, activiteId: { in: activiteIds } };
         const [clients, activites, articles, produits, ventes, credits, mouvementsCaisse, financements] = await Promise.all([
-            prisma_1.prisma.client.findMany({ where, orderBy: { updatedAt: 'asc' } }),
+            prisma_1.prisma.client.findMany({ where: whereActivite, orderBy: { updatedAt: 'asc' } }),
             prisma_1.prisma.activite.findMany({
                 where: since
                     ? { updatedAt: { gt: since }, id: { in: activiteIds } }
